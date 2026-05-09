@@ -2,7 +2,7 @@
 
 This repository contains a trimmed and cleaned implementation of the paper:
 
-**Robust DoA Estimation for Low-Altitude ISAC via Dual-Domain Covariance Restructuring**
+**Beyond Covariance Recovery: Robust DOA Estimation via Task-Aligned Preconditioning for Low-Altitude ISAC**
 
 The code focuses on the main reproducible pipeline:
 
