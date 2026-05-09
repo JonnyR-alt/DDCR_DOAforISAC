@@ -1,22 +1,7 @@
-"""Two-stage automated training launcher.
+"""End-to-end launcher for DDCR-DoA experiments.
 
-This script runs the exact two-stage procedure described by the user:
-
-Stage-1 (20 epochs):
-  lambda_dir=1.0, lambda_doa=0.0, lambda_fft_recon=1.0, lambda_phase_recon=0.0
-  base_lr=1e-3, max_lr=5e-3, min_lr=1e-4, warmup=30,
-    num_epochs=20, num_sched_epochs=180
-    NOTE: num_sched_epochs is kept as 180 (same as the original 200-epoch recipe)
-                so the LR at epoch 1..20 matches the prefix of the full schedule; we
-                simply stop training after 20 epochs.
-
-Stage-2 (100 epochs):
-  load stage-1 checkpoint
-  lambda_dir=0.1, lambda_doa=1.0, lambda_fft_recon=0.2, lambda_phase_recon=0.0
-  base_lr=2.5e-4, max_lr=2.5e-4, min_lr=1e-6, warmup=10,
-  num_epochs=100, num_sched_epochs=80
-
-It calls train.py twice as separate processes.
+The launcher can regenerate synthetic data, preprocess covariance matrices,
+run stage-1 geometric pretraining, and run stage-2 DoA fine-tuning.
 """
 
 from __future__ import annotations
@@ -160,17 +145,14 @@ def main(snr: int, M: int, signal_nature: str, T: int, doa_gap = 15.0) -> None:
     Train_model = True
 
     root = Path(__file__).resolve().parent
+    data_pipeline_dir = root / "data_pipeline"
     train_py = root / "train.py"
     if not train_py.exists():
         raise FileNotFoundError(f"train.py not found next to this file: {train_py}")
 
     args = _build_parser(snr=snr, M=M, signal_nature=signal_nature, T=T, doa_gap=doa_gap).parse_args()
 
-    '''
-        每次进入main函数，首先删除datasets/generated_cov_svd以及datasets/processed_cov_svd目录下的所有文件，以确保每次训练都是从干净的状态开始的。
-        之后首先运行fgen_data.py生成数据，然后再运行cov_svd_processing.py处理数据，最后才进入两阶段训练的流程。
-    '''
-    # Clean up generated/processed data to ensure fresh start
+    # Clean generated/processed data for a fresh run.
     if Delete_folder:
         for subdir in ["generated_snapshots", "processed_cov_svd"]:
             dir_path = root / "datasets" / subdir
@@ -182,7 +164,7 @@ def main(snr: int, M: int, signal_nature: str, T: int, doa_gap = 15.0) -> None:
     if create_data:
         fgen_cmd = [
             sys.executable,
-            str(root / "f_gendata.py"),
+            str(data_pipeline_dir / "f_gendata.py"),
             "--N",
             str(args.N),
             "--M",
@@ -208,7 +190,7 @@ def main(snr: int, M: int, signal_nature: str, T: int, doa_gap = 15.0) -> None:
 
         proc_cmd = [
             sys.executable,
-            str(root / "cov_svd_processing.py"),
+            str(data_pipeline_dir / "cov_svd_processing.py"),
             "--N",
             str(args.N),
             "--M",
@@ -359,14 +341,5 @@ def main(snr: int, M: int, signal_nature: str, T: int, doa_gap = 15.0) -> None:
 
 
 if __name__ == "__main__":
-    snr_list = [5.0]
-    signal_nature_list = ["coherent"]
-    T_list = [1]
-    M_list = [4]
-    doa_gap_list = [0.0]
-    for snr in snr_list:
-        for signal_nature in signal_nature_list:
-            for T in T_list:
-                for M in M_list:
-                    for doa_gap in doa_gap_list:
-                        main(snr=snr, M=M, signal_nature=signal_nature, T=T, doa_gap=doa_gap)
+    # Paper-style default: coherent, four sources, few snapshots.
+    main(snr=5.0, M=4, signal_nature="coherent", T=2, doa_gap=0.0)

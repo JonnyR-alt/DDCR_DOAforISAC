@@ -268,6 +268,10 @@ class SpatialRefinementBlock(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=32, enforce_hermitian=True):
         super().__init__()
         self.enforce_hermitian = enforce_hermitian
+        # 是否启用 Forward-Backward Averaging (FBA)
+        # Controlled by DDCRNet.use_fba (default: False), so clean targets can
+        # receive the same projection during training/validation if enabled.
+        self.use_fba = False
         # 保持你原有的网络结构不变，这部分设计很好
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
@@ -314,8 +318,36 @@ class SpatialRefinementBlock(nn.Module):
         diag = torch.diagonal(sym_imag, dim1=-2, dim2=-1)
         sym_imag = sym_imag - torch.diag_embed(diag)
 
-        # 重新拼接
-        return torch.stack([sym_real, sym_imag], dim=1)
+        # [Optional] Forward-Backward Averaging (Centro-Hermitian enforcement)
+        # 仅在 self.use_fba=True 时启用，避免与使用 clean 协方差监督时产生不可达的 loss floor。
+        out_ri = torch.stack([sym_real, sym_imag], dim=1)
+        if self.use_fba:
+            out_ri = apply_fba_ri(out_ri)
+        return out_ri
+
+
+def apply_fba_ri(x_ri: torch.Tensor) -> torch.Tensor:
+    """Apply Forward-Backward Averaging (FBA) to RI-form covariance.
+
+    Args:
+        x_ri: (B,2,N,N) with x_ri[:,0]=Real, x_ri[:,1]=Imag
+
+    Returns:
+        (B,2,N,N) after centro-Hermitian projection:
+        R_fb = 0.5 * (R + J * conj(R) * J)
+    """
+    if x_ri.dim() != 4 or x_ri.size(1) != 2 or x_ri.size(-1) != x_ri.size(-2):
+        raise ValueError(f"Expect x_ri with shape (B,2,N,N), got {tuple(x_ri.shape)}")
+    real = x_ri[:, 0]
+    imag = x_ri[:, 1]
+
+    # J * X * J 等价于翻转最后两个维度 (flip up-down & left-right)
+    real_flip = torch.flip(real, dims=[-2, -1])
+    imag_flip = torch.flip(imag, dims=[-2, -1])
+
+    out_real = 0.5 * (real + real_flip)
+    out_imag = 0.5 * (imag - imag_flip)
+    return torch.stack([out_real, out_imag], dim=1)
 
 
 def diag_whiten_hermitian(R: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -334,43 +366,51 @@ def diag_whiten_hermitian(R: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (inv_sqrt.unsqueeze(-1) * R) * inv_sqrt.unsqueeze(-2)
 
 
-# -------------------- SVD Predictor  --------------------
-class SVDNet(nn.Module):
+# -------------------- DDCR Predictor  --------------------
+class DDCRNet(nn.Module):
     def __init__(self, M: int, N: int, r: int,
                  dim: int = 64, depth: int = 2, groups: int = 4, attn_dim = 32, doa_num_baselines: int = 4,
                  kernel_size: int = 3, temperature: float = 0.2,
                  k_len: int = 8, tau_s: float = 0.9, gate_hidden: int = 32,
-                 input_mode: str = "cov", snap_T: int | None = None):
+                 task_mode: str = "doa", num_cls_max_sources: int = 4,
+                 refine_mode: str = "both"):
         super().__init__()
         self.M, self.N, self.r = M, N, r
-        self.input_mode = str(input_mode or "cov").lower()
-        if self.input_mode not in {"cov", "snap"}:
-            raise ValueError(f"Unknown input_mode={input_mode}, expected 'cov' or 'snap'.")
-        self.snap_T = int(snap_T) if snap_T is not None else None
         self.temperature = temperature
         self.tau_s = tau_s
         self.k_len = k_len
         self.gate_hidden = gate_hidden
         self.groups = groups
         self.depth = depth
-        # embedding dimension (token hidden size).
-        # NOTE: do NOT confuse with raw snapshot feature dim (2*T).
-        self.dim = int(dim)
+        self.dim = dim
         self.attn_dim = attn_dim
         self.doa_num_baselines = int(doa_num_baselines)
+        self.task_mode = str(task_mode).lower().strip()
+        if self.task_mode not in {"doa", "num_cls"}:
+            raise ValueError(f"task_mode must be 'doa' or 'num_cls', got: {task_mode}")
+        self.num_cls_max_sources = int(num_cls_max_sources)
+        if self.num_cls_max_sources < 2:
+            raise ValueError("num_cls_max_sources must be >= 2 for classification")
 
         # DoA output clipping: tanh-compression near +/-90deg can saturate gradients.
         # Keep it OFF by default; enable only for inference safety if needed.
         self.clip_theta = False
 
-        # (Step-1) Spectral Refinement (Replaces simple FreqGate)
-        # Move the Conv-based denoising to Frequency domain.
+        # (Step-1) Spectral Refinement (FFT域)
         # enforce_hermitian=False because FFT spectrum is NOT Hermitian symmetric.
         self.spectral_refine = SpatialRefinementBlock(in_channels=2, hidden_channels=32, enforce_hermitian=False)
 
-        # (Step-2) Spatial Refinement (Optional Post-IFFT cleanup)
-        # Keep this for strict Hermitian enforcement and additional spatial denoising.
+        # (Step-2) Spatial Refinement (空域)
         self.spatial_refine = SpatialRefinementBlock(in_channels=2, hidden_channels=32, enforce_hermitian=True)
+
+        # Forward-Backward Averaging (FBA) switch: keep OFF by default.
+        # If enabled, we must apply the same transform to clean targets in train/validate.
+        self.use_fba = False
+        self.spatial_refine.use_fba = self.use_fba
+
+        # Refinement switch:
+        #   both / spectral_only / spatial_only / none
+        self.set_refine_mode(refine_mode)
 
         # Diagonal whitening / normalization (recommended ON for low SNR)
         self.use_diag_whiten = False
@@ -380,46 +420,11 @@ class SVDNet(nn.Module):
         # self.channel_fusion = ChannelAttentionFusion(in_channels=2 * N, reduction= 4)
 
         # backbone
-        # cov-mode token dim: each row has N complex entries -> 2N real features
         self.input_proj = nn.Linear(2 * N, dim)
-
-        # snap-mode token dim: each sensor token uses T complex samples -> 2T real features
-        # Separate proj keeps cov/snap ablation clean.
-        self.input_proj_snap = None
-        if self.input_mode == "snap":
-            if self.snap_T is None:
-                raise ValueError("input_mode='snap' requires snap_T (e.g. 200).")
-            self.input_proj_snap = nn.Linear(2 * self.snap_T, dim)
-
-        # -------------------- Signal-as-Token (snap-mode): reg token + reconstruction head --------------------
-        # reg token follows the paper: concatenate with real/imag parts along antenna dimension.
-        # Here we implement it as TWO learnable tokens (Real-token, Imag-token).
-        self.use_reg_token = (self.input_mode == "snap")
-        self.reg_tokens_ri = None
-        self.reg_doa_head = None
-        self.snap_recon_head = None
-        if self.use_reg_token:
-            # (1,2,dim): two tokens
-            self.reg_tokens_ri = nn.Parameter(torch.zeros(1, 2, dim))
-            nn.init.trunc_normal_(self.reg_tokens_ri, std=0.02)
-            # DoA regression head reads the two reg tokens
-            self.reg_doa_head = nn.Sequential(
-                nn.Linear(2 * dim, dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.1),
-                nn.Linear(dim, 2 * self.r),  # per-source (sin,cos)
-            )
-            # Reconstruction head maps each sensor token back to 2T real values
-            self.snap_recon_head = nn.Sequential(
-                nn.LayerNorm(dim),
-                nn.Linear(dim, dim),
-                nn.GELU(),
-                nn.Linear(dim, 2 * int(self.snap_T)),
-            )
         
         # [Optimization] Use fixed Sinusoidal Positional Encoding for ULA geometry inductive bias.
         # Learnable POS can overfit to specific sensor indices.
-        self.pos_fixed = self._get_sinusoidal_pos_enc(M, dim)
+        self.pos_fixed = self._get_sinusoidal_pos_enc(self.N, dim)
         self.register_buffer('pos', self.pos_fixed) # Registered as buffer (not a parameter)
 
         # 修改
@@ -456,35 +461,20 @@ class SVDNet(nn.Module):
             nn.Linear(dim, dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
-            nn.Linear(dim, 2 * self.r),  # (sin, cos) for each of r sources
+            nn.Linear(dim, 2 * self.M),  # (sin, cos) for each of r sources
         )
 
-        # -------------------- DoA head (legacy): derived from predicted U --------------------
-        # Kept for backward compatibility / ablations.
-        # self.doa_u_proj = nn.Linear(3 * self.doa_num_baselines, dim)
-        # self.doa_u_conv = GatedConv1D(dim, k=5)
-        # self.doa_u_pool = nn.Linear(dim, 1)
-        # self.doa_u_head = nn.Sequential(
+        # -------------------- Source-count head (independent task) --------------------
+        # Used when task_mode == "num_cls".
+        # Class index 0..C-1 corresponds to source count 1..C.
+        # self.count_pool = nn.Linear(dim, 1)
+        # self.count_head = nn.Sequential(
         #     nn.Linear(dim, dim),
         #     nn.ReLU(inplace=True),
         #     nn.Dropout(0.1),
-        #     nn.Linear(dim, 2),
+        #     nn.Linear(dim, self.num_cls_max_sources),
         # )
-        # self.doa_u_proj = nn.Sequential(
-        #     nn.Linear(3, doa_h),
-        #     nn.ReLU(inplace=True),
-        # )
-        # self.doa_u_conv = GatedConv1D(doa_h, k=5)
-        # self.doa_u_pool = nn.Sequential(
-        #     nn.Linear(doa_h, doa_h // 2),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(doa_h // 2, 1),
-        # )
-        # self.doa_u_head = nn.Sequential(
-        #     nn.Linear(doa_h, doa_h),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(doa_h, 2),
-        # )
+
         self.apply(self._init)
 
     def _get_sinusoidal_pos_enc(self, M, dim):
@@ -511,98 +501,34 @@ class SVDNet(nn.Module):
         if epoch_id > epoch_end:
             self.tau_s = tau_end
 
+    def set_refine_mode(self, refine_mode: str = "both"):
+        """Set refinement path.
+
+        Args:
+            refine_mode: one of {"both", "spectral_only", "spatial_only", "none"}
+        """
+        mode = str(refine_mode).lower().strip()
+        valid_modes = {"both", "spectral_only", "spatial_only", "none"}
+        if mode not in valid_modes:
+            raise ValueError(f"refine_mode must be one of {valid_modes}, got: {refine_mode}")
+        self.refine_mode = mode
+        self.use_spectral_refine = mode in {"both", "spectral_only"}
+        self.use_spatial_refine = mode in {"both", "spatial_only"}
+
     def forward(self, H, return_aux: bool = False):
         """Forward.
 
         Args:
-            H: (B,M,N,2) real/imag (or complex (B,M,N))
+                        H: (B,N,N,2) real/imag (or complex (B,N,N))
             return_aux: if True, also return a dict of intermediate tensors
 
         Returns:
-            (U, S, V, theta_deg) or (U, S, V, theta_deg, aux)
+                        task_mode='doa':
+                            (U, S, V, theta_deg) or (U, S, V, theta_deg, aux)
+                        task_mode='num_cls':
+                            (count_logits,) or (count_logits, aux)
         """
         B = H.size(0)
-
-        # -------------------- SNAPSHOT TOKEN MODE --------------------
-        # H: complex snapshots (B,T,N) or real/imag (B,T,N,2)
-        # tokens: (B,N,2T) -> backbone -> heads
-        if self.input_mode == "snap":
-            aux = {} if bool(return_aux) else None
-
-            if H.dim() == 4 and H.size(-1) == 2:
-                X = torch.view_as_complex(H.to(torch.float32).contiguous())
-            elif torch.is_complex(H):
-                X = H
-            else:
-                raise ValueError(
-                    f"input_mode='snap' expects (B,T,N) complex or (B,T,N,2), got {tuple(H.shape)}"
-                )
-            if X.dim() != 3:
-                raise ValueError(f"snapshots must be 3D (B,T,N), got {tuple(X.shape)}")
-            if X.shape[-1] != self.N:
-                raise ValueError(f"snapshots last dim must be N={self.N}, got {X.shape[-1]}")
-            if self.snap_T is not None and X.shape[1] != self.snap_T:
-                raise ValueError(f"snapshots T mismatch: expected {self.snap_T}, got {X.shape[1]}")
-            if self.input_proj_snap is None:
-                raise RuntimeError("input_proj_snap is None but input_mode='snap'.")
-
-            # energy normalize per example for stability
-            eps = 1e-8
-            scales = torch.sqrt((X.real ** 2 + X.imag ** 2).sum(dim=(-2, -1)) + eps)  # (B,)
-            Xn = X / (scales.view(B, 1, 1) + eps)
-
-            # sensor tokens: (B,T,N)->(B,N,T)->(B,N,2T)
-            Xn_nt = Xn.transpose(1, 2).contiguous()  # (B,N,T)
-            f = torch.view_as_real(Xn_nt)  # (B,N,T,2)
-            # NOTE: numpy complex128 -> torch complex128 -> view_as_real -> float64.
-            # Linear layers are float32 by default, so cast to float32 here.
-            f = f.reshape(B, self.N, -1).to(torch.float32)  # (B,N,2T)
-            if aux is not None:
-                aux["X_norm"] = Xn_nt
-
-            # sensor tokens embedding
-            x_tokens = self.input_proj_snap(f) + self.pos  # (B,N,dim)
-
-            # prepend 2 reg tokens (Real/Imag) like Signal-as-Token
-            if self.use_reg_token and self.reg_tokens_ri is not None:
-                reg = self.reg_tokens_ri.expand(B, -1, -1)  # (B,2,dim)
-                x = torch.cat([reg, x_tokens], dim=1)  # (B,2+N,dim)
-            else:
-                x = x_tokens
-            for blk in self.blocks:
-                x = x + blk(x)
-            x_n = self.norm(x)
-
-            # DoA prediction: from reg tokens if enabled
-            if self.use_reg_token and self.reg_doa_head is not None:
-                reg_out = x_n[:, :2, :].reshape(B, -1)  # (B,2*dim)
-                sincos = self.reg_doa_head(reg_out).view(B, self.r, 2)  # (B,r,2)
-                theta_rad = torch.atan2(sincos[..., 0], sincos[..., 1])
-                theta_deg = theta_rad * (180.0 / math.pi)
-            else:
-                theta_deg = self.predict_theta_deg_from_x(x_n)
-
-            # snapshot reconstruction: only over sensor tokens (exclude reg tokens)
-            if self.use_reg_token and self.snap_recon_head is not None:
-                sensor_feat = x_n[:, 2:, :]  # (B,N,dim)
-                recon_flat = self.snap_recon_head(sensor_feat)  # (B,N,2T)
-                recon_ri = recon_flat.view(B, self.N, int(self.snap_T), 2)
-                recon_ri = recon_ri.permute(0, 2, 1, 3).contiguous()  # (B,T,N,2)
-                snap_recon = torch.view_as_complex(recon_ri.to(torch.float32))  # (B,T,N)
-                if aux is not None:
-                    aux["snap_recon"] = snap_recon
-
-            # placeholders for U/S/V to keep training script compatible
-            U = torch.zeros((B, self.N, self.r), device=x_n.device, dtype=torch.complex64)
-            S_best = scales.view(B, 1).repeat(1, self.r).to(torch.float32)
-            V = U.clone()
-
-            out = (U, S_best, V, theta_deg)
-            if aux is not None:
-                return out + (aux,)
-            return out
-
-        # -------------------- COVARIANCE MODE (original) --------------------
         H, scale = self.frobenius_norm_normalize(H)
         if H.dim() == 4 and H.shape[-1] == 2:
             H = torch.view_as_complex(H.to(torch.float32))
@@ -617,31 +543,31 @@ class SVDNet(nn.Module):
         if aux is not None:
             aux["H_whiten"] = H
 
-        # frequency domain processing
-        Hf_pre = torch.fft.fft2(H, norm='ortho')
-        if aux is not None:
-            aux["Hf_pre"] = Hf_pre
+        Hd = H
+        if self.use_spectral_refine:
+            # frequency-domain processing
+            Hf_pre = torch.fft.fft2(Hd, norm='ortho')
+            if aux is not None:
+                aux["Hf_pre"] = Hf_pre
 
-        # [MODIFIED] Use Spectral Refinement Block (CNN) instead of FreqGate
-        # Hf is (B, M, N) complex. Convert to (B, 2, M, N) for CNN.
-        Hf_ri = torch.view_as_real(Hf_pre).permute(0, 3, 1, 2).contiguous()
-        Hf_ri = self.spectral_refine(Hf_ri)
-        Hf_post = torch.view_as_complex(Hf_ri.permute(0, 2, 3, 1).contiguous())
-        if aux is not None:
-            aux["Hf_post"] = Hf_post
+            # Hf is (B, M, N) complex. Convert to (B, 2, M, N) for CNN.
+            Hf_ri = torch.view_as_real(Hf_pre).permute(0, 3, 1, 2).contiguous()
+            Hf_ri = self.spectral_refine(Hf_ri)
+            Hf_post = torch.view_as_complex(Hf_ri.permute(0, 2, 3, 1).contiguous())
+            if aux is not None:
+                aux["Hf_post"] = Hf_post
 
-        Hd = torch.fft.ifft2(Hf_post, norm='ortho')
-        if aux is not None:
-            aux["Hd_ifft"] = Hd
+            Hd = torch.fft.ifft2(Hf_post, norm='ortho')
+            if aux is not None:
+                aux["Hd_ifft"] = Hd
 
-        # NEW: Spatial Refinement (Denoising)
-        # Hd is (B, M, N) complex64. Convert to (B, 2, M, N) float32
-        Hd_ri = torch.view_as_real(Hd).permute(0, 3, 1, 2).contiguous()
-        Hd_ri = self.spatial_refine(Hd_ri)
-        # Convert back to (B, M, N) complex64 just for naming consistency (though next line splits it anyway)
-        Hd = torch.view_as_complex(Hd_ri.permute(0, 2, 3, 1).contiguous())
-        if aux is not None:
-            aux["Hd_refined"] = Hd
+        if self.use_spatial_refine:
+            # spatial-domain refinement
+            Hd_ri = torch.view_as_real(Hd).permute(0, 3, 1, 2).contiguous()
+            Hd_ri = self.spatial_refine(Hd_ri)
+            Hd = torch.view_as_complex(Hd_ri.permute(0, 2, 3, 1).contiguous())
+            if aux is not None:
+                aux["Hd_refined"] = Hd
 
         # Optional whitening after refine (usually OFF; helpful for ablations)
         if bool(getattr(self, "whiten_after_refine", False)):
@@ -650,23 +576,33 @@ class SVDNet(nn.Module):
             aux["Hd_final"] = Hd
 
         # dual representation
-        f1 = torch.view_as_real(Hd).reshape(B, self.M, -1)  # (B,M,2N)
-        # f2 = torch.view_as_real(Hc).reshape(B, self.M, -1)  # (B,M,2N)
+        f1 = torch.view_as_real(Hd).reshape(B, self.N, -1)
         x = self.input_proj(torch.cat([f1], dim=-1)) + self.pos
 
         for blk in self.blocks:
             x = x + blk(x)
         x_n = self.norm(x)
+        if aux is not None:
+            aux["x_n"] = x_n
+
+        if self.task_mode == "num_cls":
+            att_logits = self.count_pool(x_n)               # (B,N,1)
+            att = torch.softmax(att_logits, dim=1)          # (B,N,1)
+            z_global = torch.sum(att * x_n, dim=1)          # (B,dim)
+            count_logits = self.count_head(z_global).to(torch.float32)
+            if aux is not None:
+                aux["count_logits"] = count_logits
+                return (count_logits, aux)
+            return (count_logits,)
+
         feat = self.u_head(x_n)
 
         # ---- DoA prediction: from token features x_n (before u) ----
         theta_deg = self.predict_theta_deg_from_x(x_n)
 
         # heads
-        feat = feat.view(B, self.M, self.r, 2)
+        feat = feat.view(B, self.N, self.r, 2)
         U = torch.view_as_complex(feat)
-        # V = torch.view_as_complex(self.v_head(feat).view(B, self.N, 2))
-        # S_pred = self.s_head(feat) + 1e-6
 
         # column normalization + sorting
         U = U / (torch.linalg.norm(U, dim=1, keepdim=True) + 1e-8)
@@ -736,33 +672,13 @@ class SVDNet(nn.Module):
         att = torch.softmax(att_logits, dim=1)
         z_global = torch.sum(att * z, dim=1)
         doa_sc = self.doa_x_head(z_global)
-        doa_sc = doa_sc.view(-1, self.r, 2)
+        doa_sc = doa_sc.view(-1, self.M, 2)
         doa_sc = doa_sc / (torch.linalg.norm(doa_sc, dim=-1, keepdim=True) + 1e-8)
         theta_rad = torch.atan2(doa_sc[:, :, 0], doa_sc[:, :, 1])
         theta_deg = theta_rad * (180.0 / math.pi)
         if bool(getattr(self, "clip_theta", False)):
             theta_deg = 90.0 * torch.tanh(theta_deg / 90.0)
         return theta_deg.to(torch.float32)
-
-    def _doa_features_from_u(self, u_complex: torch.Tensor) -> torch.Tensor:
-        """Build per-edge features from complex u.
-
-        Args:
-            u_complex: (B, M) complex
-        Returns:
-            edge_feat: (B, M-1, 3) float32 with [Re(c), Im(c), |c|],
-                      where c_m = conj(u_m) * u_{m+1}
-        """
-        if u_complex.dim() != 2:
-            raise ValueError(f"Expect u_complex with shape (B,M), got {tuple(u_complex.shape)}")
-        u = u_complex.to(torch.complex64)
-        u = u / (torch.linalg.norm(u, dim=1, keepdim=True) + 1e-8)
-        if u.shape[1] < 2:
-            # no adjacent edge exists; return a dummy edge to avoid crash
-            B, M = u.shape
-            return torch.zeros((B, 1, 3), device=u.device, dtype=torch.float32)
-        c = torch.conj(u[:, :-1]) * u[:, 1:]
-        return torch.stack([c.real, c.imag, torch.abs(c)], dim=-1).to(torch.float32)
 
     def _doa_features_from_u2(self, U: torch.Tensor) -> torch.Tensor:
         """
@@ -814,30 +730,6 @@ class SVDNet(nn.Module):
 
         return feat
 
-    def predict_theta_deg_from_u(self, u_complex: torch.Tensor) -> torch.Tensor:
-        """Predict DoA (deg) from a provided complex u using the model's DoA head.
-
-        This is used by ablation scripts to feed GT-u into the same learnable DoA head.
-
-        Args:
-            u_complex: (B, M) complex
-        Returns:
-            theta_deg: (B,) float32
-        """
-        edge_feat = self._doa_features_from_u2(u_complex)  # (B, M-1, 3)
-        z = self.doa_u_proj(edge_feat)
-        z = z + self.doa_u_conv(z)
-        att_logits = self.doa_u_pool(z)
-        att = torch.softmax(att_logits, dim=1)
-        z_global = torch.sum(att * z, dim=1)
-        doa_sc = self.doa_u_head(z_global)
-        doa_sc = doa_sc / (torch.linalg.norm(doa_sc, dim=-1, keepdim=True) + 1e-8)
-        theta_rad = torch.atan2(doa_sc[:, 0], doa_sc[:, 1])
-        theta_deg = theta_rad * (180.0 / math.pi)
-        if bool(getattr(self, "clip_theta", False)):
-            theta_deg = 90.0 * torch.tanh(theta_deg / 90.0)
-        return theta_deg.to(torch.float32)
-
     def frobenius_norm_normalize(self, x: torch.Tensor, eps: float = 1e-8):
         assert x.dim() == 4 and x.size(-1) == 2, "Expect x of shape (B,M,N,2)"
         # 计算 |H|^2 = Re^2 + Im^2
@@ -850,193 +742,3 @@ class SVDNet(nn.Module):
         return x_norm, scales
 
 
-class IterativeSVDNetWrapper(nn.Module):
-    """Iterative (deflation-style) wrapper for multi-source estimation.
-
-    This wrapper keeps the base network unchanged (it predicts ONE complex vector per call),
-    and unrolls K steps:
-
-        u_i = base_net(R_i)
-        P_i = u_i u_i^H
-        R_{i+1} = (I - P_i) R_i (I - P_i)
-
-    Notes:
-    - Input is expected to be complex matrix in real/imag format: (B, N, N, 2).
-    - The returned U_seq is (B, K, N, 2) in the same real/imag format.
-    - For numerical stability, u_i is re-normalized to unit norm and P_i is regularized.
-    """
-
-    def __init__(self, base_net: nn.Module, eps: float = 1e-8, detach_deflation: bool = False):
-        super().__init__()
-        self.base_net = base_net
-        self.eps = float(eps)
-        self.detach_deflation = bool(detach_deflation)
-
-    def _to_complex_mat(self, R_ri: torch.Tensor) -> torch.Tensor:
-        # R_ri: (B,N,N,2) -> complex (B,N,N)
-        if R_ri.dim() != 4 or R_ri.size(-1) != 2:
-            raise ValueError(f"Expect R with shape (B,N,N,2), got {tuple(R_ri.shape)}")
-        return torch.view_as_complex(R_ri.to(torch.float32))
-
-    def _to_ri(self, X: torch.Tensor) -> torch.Tensor:
-        # complex -> (..,2) float32
-        return torch.view_as_real(X)
-
-    def forward(self, R_ri: torch.Tensor, K: int, return_residual: bool = False):
-        """Run K-step iterative estimation.
-
-        Args:
-            R_ri: (B,N,N,2) real/imag covariance-like matrix.
-            K: number of sources/iterations.
-            return_residual: if True, also return final residual matrix (B,N,N,2).
-
-        Returns:
-            U_seq_ri: (B,K,N,2)
-            (optional) R_res_ri: (B,N,N,2)
-        """
-
-        K = int(K)
-        if K <= 0:
-            raise ValueError("K must be positive")
-
-        R = self._to_complex_mat(R_ri)  # (B,N,N)
-        B, N, N2 = R.shape
-        if N != N2:
-            raise ValueError(f"Expect square matrix, got {tuple(R.shape)}")
-
-        I = torch.eye(N, device=R.device, dtype=R.dtype).unsqueeze(0)  # (1,N,N)
-
-        u_list = []
-        doa_list = []
-        for _ in range(K):
-            # base net expects (B,M,N,2); here we use N as both M and N
-            out = self.base_net(self._to_ri(R))
-            # backward compatible: allow base_net to return either 3-tuple or 4-tuple
-            if isinstance(out, (list, tuple)) and len(out) == 4:
-                u_c, _, _, theta_deg = out
-            else:
-                u_c, _, _ = out
-                theta_deg = None
-            u_c = u_c.to(R.dtype)
-            # unit-norm
-            u_c = u_c / (torch.linalg.norm(u_c, dim=1, keepdim=True) + self.eps)
-            u_list.append(self._to_ri(u_c))  # (B,N,2)
-            if theta_deg is not None:
-                doa_list.append(theta_deg)
-
-            # PSD-friendly deflation: R <- P_perp R P_perp
-            u_col = u_c.unsqueeze(-1)  # (B,N,1)
-            P = u_col @ u_col.conj().transpose(-2, -1)  # (B,N,N)
-            P_perp = I - P
-            if self.detach_deflation:
-                P_perp = P_perp.detach()
-            R = P_perp @ R @ P_perp
-            # keep Hermitian numerically
-            R = 0.5 * (R + R.conj().transpose(-2, -1))
-
-        U_seq_ri = torch.stack(u_list, dim=1)  # (B,K,N,2)
-        doa_seq = torch.stack(doa_list, dim=1) if len(doa_list) > 0 else None  # (B,K)
-        if return_residual:
-            return U_seq_ri, doa_seq, self._to_ri(R)
-        return U_seq_ri, doa_seq
-
-
-    def frobenius_norm_normalize(self, x: torch.Tensor, eps: float = 1e-8):
-        assert x.dim() == 4 and x.size(-1) == 2, "Expect x of shape (B,M,N,2)"
-        # 计算 |H|^2 = Re^2 + Im^2
-        mag2 = x[..., 0] ** 2 + x[..., 1] ** 2
-
-        # Frobenius 范数：sqrt( sum_{m,n} |H_{mn}|^2 )
-        scales = torch.sqrt(mag2.sum(dim=(-2, -1), keepdim=True) + eps)
-        scales = scales.unsqueeze(-1)
-        x_norm = x / (scales + eps)
-        return x_norm, scales
-
-
-    # ------------ Step-3: Export a structurally pruned model ------------
-    @torch.no_grad()
-    def export_pruned_model(self, keep_k_len: int, keep_gate_hidden: int):
-        keep_k_len = int(max(8, min(self.k_len, keep_k_len)))
-        keep_gate_hidden = int(max(8, min(self.gate_hidden, keep_gate_hidden)))
-
-        # 1) new model with smaller k_len & gate hidden
-        new_model = SVDNet(self.M, self.N, self.r,
-                                   dim=self.dim, depth=self.depth, groups=self.groups,
-                                   kernel_size=3, temperature=self.temperature,
-                                   k_len=keep_k_len, tau_s=self.tau_s, gate_hidden=keep_gate_hidden)
-
-        def copy_like(a, b):
-            if a.shape == b.shape: b.data.copy_(a.data)
-
-        # 2) shared weights_u_based
-        copy_like(self.input_proj.weight, new_model.input_proj.weight)
-        copy_like(self.input_proj.bias, new_model.input_proj.bias)
-        new_model.pos.data.copy_(self.pos.data)
-        new_model.scene_emb.weight.data.copy_(self.scene_emb.weight.data)
-
-        # 3) blocks (LN + GPA / GatedConv)
-        for blk_old, blk_new in zip(self.blocks, new_model.blocks):
-            mods_old = list(blk_old.children())
-            mods_new = list(blk_new.children())
-            # LayerNorm
-            copy_like(mods_old[0].weight, mods_new[0].weight)
-            copy_like(mods_old[0].bias, mods_new[0].bias)
-            if isinstance(mods_old[1], GroupedProjectedAttention):
-                gpa_old: GroupedProjectedAttention = mods_old[1]
-                gpa_new: GroupedProjectedAttention = mods_new[1]
-                # Q/K/V/O identical
-                for (qo, qn) in zip(gpa_old.qs, gpa_new.qs): copy_like(qo.weight, qn.weight)
-                for (ko, kn) in zip(gpa_old.ks, gpa_new.ks): copy_like(ko.weight, kn.weight)
-                for (vo, vn) in zip(gpa_old.vs, gpa_new.vs): copy_like(vo.weight, vn.weight)
-                for (oo, on) in zip(gpa_old.os, gpa_new.os): copy_like(oo.weight, on.weight)
-                # column selection for Pk/Pv by energy
-                alpha = 1.0
-                for g in range(gpa_old.groups):
-                    Pk = gpa_old.Pk[g].data
-                    Pv = gpa_old.Pv[g].data
-                    score = (Pk.pow(2).sum(dim=0) + alpha * Pv.pow(2).sum(dim=0)).cpu().numpy()
-                    keep_idx = np.argsort(-score)[:keep_k_len]
-                    keep_idx = np.sort(keep_idx)
-                    gpa_new.Pk[g].data.copy_(Pk[:, keep_idx])
-                    gpa_new.Pv[g].data.copy_(Pv[:, keep_idx])
-            else:
-                gc_old: GatedConv1D = mods_old[1]
-                gc_new: GatedConv1D = mods_new[1]
-                copy_like(gc_old.dw.weight, gc_new.dw.weight);
-                copy_like(gc_old.dw.bias, gc_new.dw.bias)
-                copy_like(gc_old.pw.weight, gc_new.pw.weight);
-                copy_like(gc_old.pw.bias, gc_new.pw.bias)
-
-        # 4) heads
-        copy_like(self.u_head.weight, new_model.u_head.weight);
-        copy_like(self.u_head.bias, new_model.u_head.bias)
-        copy_like(self.v_head.weight, new_model.v_head.weight);
-        copy_like(self.v_head.bias, new_model.v_head.bias)
-        copy_like(self.s_head[0].weight, new_model.s_head[0].weight);
-        copy_like(self.s_head[0].bias, new_model.s_head[0].bias)
-
-        # 5) freq gate hidden pruning
-        if self.freq_gate.hidden == keep_gate_hidden:
-            for i in [0, 2]:
-                copy_like(self.freq_gate.row_mlp[i].weight, new_model.freq_gate.row_mlp[i].weight)
-                copy_like(self.freq_gate.col_mlp[i].weight, new_model.freq_gate.col_mlp[i].weight)
-        else:
-            W1r = self.freq_gate.row_mlp[0].weight.data  # (hidden, M)
-            W2r = self.freq_gate.row_mlp[2].weight.data  # (M, hidden)
-            W1c = self.freq_gate.col_mlp[0].weight.data  # (hidden, N)
-            W2c = self.freq_gate.col_mlp[2].weight.data  # (N, hidden)
-            s_row = W1r.pow(2).sum(dim=1).sqrt() * W2r.pow(2).sum(dim=0).sqrt()
-            s_col = W1c.pow(2).sum(dim=1).sqrt() * W2c.pow(2).sum(dim=0).sqrt()
-            score = (s_row + s_col).cpu().numpy()
-            keep = np.argsort(-score)[:keep_gate_hidden]
-            keep = np.sort(keep)
-            new_model.freq_gate.row_mlp[0].weight.data.copy_(W1r[keep, :])
-            new_model.freq_gate.col_mlp[0].weight.data.copy_(W1c[keep, :])
-            new_model.freq_gate.row_mlp[2].weight.data.copy_(W2r[:, keep])
-            new_model.freq_gate.col_mlp[2].weight.data.copy_(W2c[:, keep])
-
-        # 6) copy ortho_refine params
-        new_model.ortho_refine.a_raw.data.copy_(self.ortho_refine.a_raw.data)
-        new_model.ortho_refine.b_raw.data.copy_(self.ortho_refine.b_raw.data)
-
-        return new_model

@@ -64,11 +64,12 @@ def _run(cmd: list[str], cwd: Path) -> None:
 def main() -> None:
     args = _build_parser().parse_args()
     root = Path(__file__).resolve().parent
+    data_pipeline_dir = root / "data_pipeline"
 
     if not args.skip_data_gen:
         gen_cmd = [
             sys.executable,
-            str(root / "f_gendata.py"),
+            str(data_pipeline_dir / "f_gendata.py"),
             "--mix_M",
             "--output_dir",
             "datasets/generated_snapshots",

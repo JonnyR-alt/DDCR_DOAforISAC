@@ -1,18 +1,23 @@
-# 用于生成阵列快拍数据，快拍保存在datasets文件夹下
 """
-Generate array snapshots and per-snapshot covariance (auto-correlation) using existing
-Samples/SystemModelParams utilities.
+Generate array snapshots and per-snapshot covariance matrices.
 
 Outputs (complex npy):
 - snapshots{_dataset_suffix}.npy: shape (num_sets, T, N)
 - covariances{_dataset_suffix}.npy: shape (num_sets, T, N, N)
 - doas{_dataset_suffix}.npy: shape (num_sets, M) (true DOAs per set)
 
-Adjust the parameters in the __main__ block as needed.
+Use CLI arguments to reproduce different source numbers, SNRs, snapshot counts,
+coherence settings, and array mismatch settings.
 """
 import argparse
 from pathlib import Path
+import sys
+
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.system_model import SystemModelParams
 from src.signal_creation import Samples
