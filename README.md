@@ -24,7 +24,6 @@ DDCR_DOA_GLOBECOM2026/
 ├── main.py
 ├── train_num_cls.py
 ├── num_cls_main.py
-├── validate.py
 ├── models/
 │   ├── ddcr_model.py
 │   └── lossfunction.py
@@ -83,12 +82,6 @@ python main.py --N 8 --M 4 --T 2 --snr 5 --signal_nature coherent --doa_gap 0.0
 
 ```bash
 python num_cls_main.py --N 8 --T 2 --snr 5 --signal_nature coherent
-```
-
-### 5. Benchmark runtime
-
-```bash
-python validate.py --weights path/to/checkpoint.pth --device cuda --mode cov
 ```
 
 ## Notes
